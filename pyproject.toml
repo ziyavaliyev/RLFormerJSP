@@ -1,0 +1,19 @@
+[project]
+name = "jsp-rl"
+version = "0.1.0"
+description = "Attention-based Reinforcement Learning for Job Shop Scheduling"
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch",
+    "numpy",
+    "ortools",
+    "pyyaml",
+    "tqdm",
+    "wandb",
+    "graph-jsp-env",
+    "gym"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
