@@ -15,10 +15,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 import wandb
 
-from jsp_il.jsp_instance import generate_jsp_instance
-from jsp_il.rl_env import JSPDispatchEnv
-from jsp_il.rl_model import JSPActorCritic
+from jsp_rl.jsp_instance import generate_jsp_instance
+from jsp_rl.rl_model import JSPActorCritic
 from graph_jsp_env.disjunctive_graph_jsp_env import DisjunctiveGraphJspEnv
+from jsp_rl.env_wrapper import (
+    make_graph_jsp_env,
+    ObservationWrapper,
+)
 
 def load_yaml(path):
     with open(path, "r") as f:
@@ -27,20 +30,12 @@ def load_yaml(path):
 
 def make_env(instances, cfg, seed):
     def thunk():
-        env = JSPDispatchEnv(
-            instances=instances,
-            reward_mode=cfg["env"]["reward_mode"],
-            reward_scale=cfg["env"]["reward_scale"],
-            seed=seed,
-        )
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        return env
-
+        return make_graph_jsp_env(instances, cfg, seed)
     return thunk
 
 
 def collect_masks(envs, device):
-    masks = envs.call("action_mask")
+    masks = envs.call("valid_action_mask")
     masks = np.stack(masks, axis=0)
     return torch.tensor(masks, dtype=torch.bool, device=device)
 
@@ -63,13 +58,13 @@ def build_instances(cfg, split="train"):
 
 
 @torch.no_grad()
-def evaluate_rl_model(model, val_instances, device):
+def evaluate_rl_model(model, val_instances, cfg, device):
 
     model.eval()
 
     makespans = []
     for instance in val_instances:
-        state_result = rollout_policy_from_ac(model, instance, device=device)
+        state_result = rollout_policy_from_ac(model, instance, cfg, device=device)
         makespans.append(state_result["makespan"])
 
     return {
@@ -77,38 +72,60 @@ def evaluate_rl_model(model, val_instances, device):
         "std_makespan": float(np.std(makespans)),
     }
 
-
 @torch.no_grad()
-def rollout_policy_from_ac(model, instance, device):
-    from jsp_il.jsp_instance import (
-        build_initial_state,
-        state_to_tokens,
-        apply_action,
-        is_done,
-        makespan,
-    )
+def rollout_policy_from_ac(model, instance, cfg, device):
 
     model.eval()
-    state = build_initial_state(instance)
+
+    env = DisjunctiveGraphJspEnv(
+        jps_instance=instance,
+        perform_left_shift_if_possible=False,
+        normalize_observation_space=True,
+        flat_observation_space=False,
+        action_mode="task",
+        reward_function="zero"
+    )
+
+    env = ObservationWrapper(env, instance)
+
+    obs, _ = env.reset()
+
+    done = False
+    truncated = False
+
     actions = []
 
-    while not is_done(instance, state):
-        tokens, mask = state_to_tokens(instance, state)
+    while not (done or truncated):
 
-        tokens_t = torch.tensor(tokens, dtype=torch.float32, device=device).unsqueeze(0)
-        mask_t = torch.tensor(mask, dtype=torch.bool, device=device).unsqueeze(0)
+        mask = env.unwrapped.valid_action_mask()
 
-        logits, _ = model.get_logits_and_value(tokens_t, mask_t)
+        obs_t = torch.tensor(
+            obs,
+            dtype=torch.float32,
+            device=device,
+        ).unsqueeze(0)
+
+        mask_t = torch.tensor(
+            mask,
+            dtype=torch.bool,
+            device=device,
+        ).unsqueeze(0)
+
+        logits, _ = model.get_logits_and_value(
+            obs_t,
+            mask_t,
+        )
+
         action = int(torch.argmax(logits, dim=1).item())
 
-        state = apply_action(instance, state, action)
+        obs, reward, done, truncated, info = env.step(action)
+
         actions.append(action)
 
     return {
-        "makespan": makespan(state),
+        "makespan": info["makespan"],
         "actions": actions,
     }
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -147,9 +164,7 @@ def main():
     train_instances = build_instances(cfg, split="train")
     val_instances = build_instances(cfg, split="val")
 
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(train_instances, cfg, seed + i) for i in range(num_envs)]
-    )
+    envs = gym.vector.SyncVectorEnv([make_env(train_instances, cfg, seed + i) for i in range(num_envs)])
 
     n_tokens = cfg["data"]["n_jobs"] * cfg["data"]["n_machines"]
 
@@ -337,7 +352,7 @@ def main():
 
         if global_step - last_eval_step >= eval_every:
             last_eval_step = global_step
-            val_metrics = evaluate_rl_model(agent, val_instances, device=device)
+            val_metrics = evaluate_rl_model(agent, val_instances, cfg, device=device)
 
             writer.add_scalar("val/mean_makespan", val_metrics["mean_makespan"], global_step)
             writer.add_scalar("val/std_makespan", val_metrics["std_makespan"], global_step)

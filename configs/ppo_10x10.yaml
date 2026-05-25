@@ -42,5 +42,5 @@ ppo:
 logging:
   use_wandb: true
   project: jsp-rl-il
-  run_name: ppo_bc_finetune_10x10
+  run_name: ppo_10x10_test
   eval_every: 10000
