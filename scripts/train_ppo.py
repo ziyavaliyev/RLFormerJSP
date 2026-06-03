@@ -5,17 +5,16 @@ import random
 import yaml
 import json
 from tqdm import trange
-
+from jsp_rl.encoder import Encoder, VariationalEncoder
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import gymnasium as gym
 from torch.utils.tensorboard import SummaryWriter
-
 import wandb
 
-from jsp_rl.jsp_instance import generate_jsp_instance
+from jsp_rl.utils import generate_jsp_instance
 from jsp_rl.rl_model import JSPActorCritic
 from graph_jsp_env.disjunctive_graph_jsp_env import DisjunctiveGraphJspEnv
 from jsp_rl.env_wrapper import (
@@ -23,22 +22,59 @@ from jsp_rl.env_wrapper import (
     ObservationWrapper,
 )
 
+def load_val_dataset(path):
+    data = torch.load(path, weights_only=False)
+    return data["instances"], data["summary"]
+
 def load_yaml(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
+def load_pretrained_encoder(path, device):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    enc_cfg = ckpt["config"]
 
-def make_env(instances, cfg, seed):
+    deg = ckpt.get("deg", None)
+    if deg is not None:
+        deg = deg.to(device)
+
+    encoder_type = enc_cfg.get("model", "gae")  # your key: "model"
+
+    EncoderClass = VariationalEncoder if encoder_type == "vgae" else Encoder
+
+    encoder = EncoderClass(
+        in_channels=enc_cfg["in_dim"],
+        hidden_channels=enc_cfg["hidden_dim"],
+        out_channels=enc_cfg["latent_dim"],
+        gnn_type=enc_cfg["gnn_type"],
+        deg=deg,
+    ).to(device)
+
+    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    encoder.eval()
+
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+
+    return encoder, enc_cfg["latent_dim"]
+
+def make_env(instances, cfg, seed, encoder=None, latent_dim=None, device="cpu"):
     def thunk():
-        return make_graph_jsp_env(instances, cfg, seed)
+        return make_graph_jsp_env(
+            instances,
+            cfg,
+            seed,
+            encoder=encoder,
+            latent_dim=latent_dim,
+            device=device,
+            sample_latent=cfg["encoder"].get("sample_latent", False),
+        )
     return thunk
-
 
 def collect_masks(envs, device):
     masks = envs.call("valid_action_mask")
     masks = np.stack(masks, axis=0)
     return torch.tensor(masks, dtype=torch.bool, device=device)
-
 
 def build_instances(cfg, split="train"):
     rng = random.Random(cfg["seed"] + (0 if split == "train" else 999))
@@ -58,35 +94,73 @@ def build_instances(cfg, split="train"):
 
 
 @torch.no_grad()
-def evaluate_rl_model(model, val_instances, cfg, device):
-
+def evaluate_rl_model(
+    model,
+    val_instances,
+    baseline_summary,
+    cfg,
+    device,
+    encoder=None,
+    latent_dim=None,
+):
     model.eval()
 
     makespans = []
-    for instance in val_instances:
-        state_result = rollout_policy_from_ac(model, instance, cfg, device=device)
-        makespans.append(state_result["makespan"])
 
-    return {
-        "mean_makespan": float(np.mean(makespans)),
-        "std_makespan": float(np.std(makespans)),
+    for instance in val_instances:
+        result = rollout_policy_from_ac(
+            model,
+            instance,
+            cfg,
+            device,
+            encoder=encoder,
+            latent_dim=latent_dim,
+        )
+
+        makespans.append(result["makespan"])
+
+    mean_makespan = float(np.mean(makespans))
+    std_makespan = float(np.std(makespans))
+
+    metrics = {
+        "mean_makespan": mean_makespan,
+        "std_makespan": std_makespan,
     }
 
-@torch.no_grad()
-def rollout_policy_from_ac(model, instance, cfg, device):
+    if "ortools" in baseline_summary:
+        ortools_mean = baseline_summary["ortools"]["mean"]
 
+        optimality_gap = (
+            (mean_makespan - ortools_mean)
+            / ortools_mean
+            * 100.0
+        )
+
+        metrics["optimality_gap_percent"] = float(optimality_gap)
+
+    return metrics
+
+@torch.no_grad()
+def rollout_policy_from_ac(model, instance, cfg, device, encoder=None, latent_dim=None):
     model.eval()
 
     env = DisjunctiveGraphJspEnv(
         jps_instance=instance,
-        perform_left_shift_if_possible=False,
+        perform_left_shift_if_possible=True,
         normalize_observation_space=True,
         flat_observation_space=False,
         action_mode="task",
         reward_function="zero"
     )
 
-    env = ObservationWrapper(env, instance)
+    env = ObservationWrapper(
+        env,
+        instance,
+        obs_mode=cfg["observation"]["mode"],
+        encoder=encoder,
+        latent_dim=latent_dim,
+        device=device,
+        sample_latent=cfg["encoder"].get("sample_latent", False))
 
     obs, _ = env.reset()
 
@@ -130,9 +204,27 @@ def rollout_policy_from_ac(model, instance, cfg, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/ppo_10x10.yaml")
+    parser.add_argument("--representation", type=str, default=None, help="Override representation for sweeps.")
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
+
+    if args.representation is not None:
+        rep = args.representation
+
+        if rep in ["handcrafted", "raw_graph", "graph_features"]:
+            cfg["observation"]["mode"] = rep
+
+        else:
+            cfg["observation"]["mode"] = "encoder"
+            cfg["encoder"]["path"] = rep
+
+        rep_name = os.path.splitext(os.path.basename(args.representation))[0]
+
+        if rep_name in ["handcrafted", "raw_graph", "graph_features"]:
+            cfg["logging"]["run_name"] = rep_name
+        else:
+            cfg["logging"]["run_name"] = rep_name
 
     seed = int(cfg["seed"])
     random.seed(seed)
@@ -162,14 +254,43 @@ def main():
     writer = SummaryWriter(f"runs/{run_name}")
 
     train_instances = build_instances(cfg, split="train")
-    val_instances = build_instances(cfg, split="val")
+    
+    val_instances, baseline_summary = load_val_dataset(cfg["data"]["val_dataset_path"])
 
-    envs = gym.vector.SyncVectorEnv([make_env(train_instances, cfg, seed + i) for i in range(num_envs)])
+    print("Validation baselines:")
+    for name, metrics in baseline_summary.items():
+        print(f"{name}: mean={metrics['mean']:.2f}")
+
+    if cfg["logging"]["use_wandb"]:
+        baseline_log = {}
+
+        for name, metrics in baseline_summary.items():
+            baseline_log[f"baseline/{name}_mean_makespan"] = metrics["mean"]
+
+        wandb.log(baseline_log, step=0)
+
+    encoder = None
+    latent_dim = None
+    if cfg["observation"]["mode"] == "encoder":
+        encoder, latent_dim = load_pretrained_encoder(cfg["encoder"]["path"], device)
+
+    envs = gym.vector.SyncVectorEnv([
+        make_env(
+            train_instances,
+            cfg,
+            seed + i,
+            encoder=encoder,
+            latent_dim=latent_dim,
+            device=device,
+        )
+        for i in range(num_envs)
+    ])
 
     n_tokens = cfg["data"]["n_jobs"] * cfg["data"]["n_machines"]
 
+    token_dim = envs.single_observation_space.shape[-1]
     agent = JSPActorCritic(
-        token_dim=cfg["model"]["token_dim"],
+        token_dim=token_dim,
         hidden_dim=cfg["model"]["hidden_dim"],
         n_heads=cfg["model"]["n_heads"],
         n_layers=cfg["model"]["n_layers"],
@@ -183,7 +304,7 @@ def main():
 
     optimizer = optim.Adam(agent.parameters(), lr=ppo["learning_rate"], eps=1e-5)
 
-    obs = torch.zeros((num_steps, num_envs, n_tokens, cfg["model"]["token_dim"]), device=device)
+    obs = torch.zeros((num_steps, num_envs, n_tokens, token_dim), device=device)
     actions = torch.zeros((num_steps, num_envs), device=device, dtype=torch.long)
     logprobs = torch.zeros((num_steps, num_envs), device=device)
     rewards = torch.zeros((num_steps, num_envs), device=device)
@@ -199,9 +320,11 @@ def main():
 
     next_obs, _ = envs.reset(seed=seed)
     next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+    
     next_done = torch.zeros(num_envs, device=device)
 
     best_val_makespan = float("inf")
+    best_optimality_gap = float("inf")
     os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
 
     pbar = trange(1, num_iterations + 1, desc="Training")
@@ -242,9 +365,7 @@ def main():
                             wandb.log({"charts/train_episode_makespan": info["makespan"]}, step=global_step)
 
         with torch.no_grad():
-            next_mask = collect_masks(envs, device)
             next_value = agent.get_value(next_obs).reshape(1, -1)
-
             advantages = torch.zeros_like(rewards, device=device)
             lastgaelam = 0
 
@@ -261,7 +382,7 @@ def main():
 
             returns = advantages + values
 
-        b_obs = obs.reshape((-1, n_tokens, cfg["model"]["token_dim"]))
+        b_obs = obs.reshape((-1, n_tokens, token_dim))
         b_masks = masks_buf.reshape((-1, n_tokens))
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape(-1)
@@ -352,15 +473,22 @@ def main():
 
         if global_step - last_eval_step >= eval_every:
             last_eval_step = global_step
-            val_metrics = evaluate_rl_model(agent, val_instances, cfg, device=device)
-
+            val_metrics = evaluate_rl_model(agent, val_instances, baseline_summary, cfg, device, encoder=encoder, latent_dim=latent_dim)
+            if "optimality_gap_percent" in val_metrics:
+                best_optimality_gap = min(best_optimality_gap, val_metrics["optimality_gap_percent"])
             writer.add_scalar("val/mean_makespan", val_metrics["mean_makespan"], global_step)
             writer.add_scalar("val/std_makespan", val_metrics["std_makespan"], global_step)
+            if "optimality_gap_percent" in val_metrics:
+                writer.add_scalar(
+                    "val/optimality_gap_percent",
+                    val_metrics["optimality_gap_percent"],
+                    global_step)
 
             if cfg["logging"]["use_wandb"]:
-                wandb.log({
+                log_dict = {
                     "val/mean_makespan": val_metrics["mean_makespan"],
-                    "val/std_makespan": val_metrics["std_makespan"],
+                    "val/optimality_gap_percent": val_metrics["optimality_gap_percent"],
+                    "val/best_optimality_gap_percent": best_optimality_gap,
                     "losses/value_loss": v_loss.item(),
                     "losses/policy_loss": pg_loss.item(),
                     "losses/entropy": entropy_loss.item(),
@@ -369,20 +497,57 @@ def main():
                     "losses/explained_variance": explained_var,
                     "charts/learning_rate": optimizer.param_groups[0]["lr"],
                     "charts/SPS": int(global_step / (time.time() - start_time)),
-                }, step=global_step)
+                }
+                wandb.log(log_dict, step=global_step)
 
             print(
                 f"step={global_step} "
                 f"val_mean_makespan={val_metrics['mean_makespan']:.2f} "
+                f"gap={val_metrics['optimality_gap_percent']:.2f}% "
                 f"SPS={int(global_step / (time.time() - start_time))}"
             )
 
-            if val_metrics["mean_makespan"] < best_val_makespan:
+            if val_metrics["optimality_gap_percent"] <= best_optimality_gap:
                 best_val_makespan = val_metrics["mean_makespan"]
                 torch.save(agent.state_dict(), f"runs/{run_name}/checkpoints/best_rl.pt")
-
+                if cfg["logging"]["use_wandb"]:
+                    artifact = wandb.Artifact(name=f"{run_name}-best-model", type="model")
+                    artifact.add_file(f"runs/{run_name}/checkpoints/best_rl.pt")
+                    artifact.add_file(f"runs/{run_name}/checkpoints/best_metrics.json")
+                    wandb.log_artifact(artifact)
+                
                 with open(f"runs/{run_name}/checkpoints/best_metrics.json", "w") as f:
                     json.dump(val_metrics, f, indent=2)
+
+    final_metrics = evaluate_rl_model(
+        agent,
+        val_instances,
+        baseline_summary,
+        cfg,
+        device,
+        encoder=encoder,
+        latent_dim=latent_dim,
+    )
+
+    writer.add_scalar("final/mean_makespan", final_metrics["mean_makespan"], global_step)
+    writer.add_scalar("final/std_makespan", final_metrics["std_makespan"], global_step)
+
+    if "optimality_gap_percent" in final_metrics:
+        writer.add_scalar(
+            "final/optimality_gap_percent",
+            final_metrics["optimality_gap_percent"],
+            global_step,
+        )
+
+    if cfg["logging"]["use_wandb"]:
+        wandb.log(
+            {
+                "final/mean_makespan": final_metrics["mean_makespan"],
+                "final/optimality_gap_percent": final_metrics.get("optimality_gap_percent"),
+                "val/best_optimality_gap_percent": best_optimality_gap,
+            },
+            step=global_step,
+        )
 
     torch.save(agent.state_dict(), f"runs/{run_name}/last_rl.pt")
 

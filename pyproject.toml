@@ -1,5 +1,5 @@
 [project]
-name = "jsp-rl"
+name = "RLFormerJSP"
 version = "0.1.0"
 description = "Attention-based Reinforcement Learning for Job Shop Scheduling"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ dependencies = [
     "tqdm",
     "wandb",
     "graph-jsp-env",
+    "torch_geometric",
     "gym"
 ]
 

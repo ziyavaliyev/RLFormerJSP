@@ -1,6 +1,67 @@
-import random
 import numpy as np
+import random
+import torch
+from torch_geometric.data import Data
+from torch_geometric.utils import degree
+import os
 
+# Computes a normalized Critical Lower Bound (CLB) for each node.
+# CLB is the earliest possible completion time given precedence constraints in A,
+# assuming operations start as early as possible and only job-order dependencies.
+def clb(A: np.ndarray, X: np.ndarray) -> np.ndarray:
+    dur = X[:, -1].astype(np.float32)          # (T,)
+    preds = (A > 0)                             # edge mask
+    indeg = preds.sum(axis=0).astype(int)       # (T,)
+
+    q = list(np.where(indeg == 0)[0])
+    clb = dur.copy()
+
+    for u in q:                                 # q grows while iterating
+        for v in np.where(preds[u])[0]:         # u -> v
+            clb[v] = max(clb[v], clb[u] + dur[v])
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+
+    if len(q) != A.shape[0]:
+        raise ValueError("A has a cycle (CLB needs a DAG).")
+
+    clb = clb / clb.max()
+    clb = clb.reshape(-1, 1)
+    return clb
+
+def compute_pna_degree_histogram(data_list):
+    max_degree = 0
+
+    for data in data_list:
+        d = degree(data.edge_index[1], num_nodes=data.num_nodes, dtype=torch.long)
+        max_degree = max(max_degree, int(d.max()))
+
+    deg = torch.zeros(max_degree + 1, dtype=torch.long)
+
+    for data in data_list:
+        d = degree(data.edge_index[1], num_nodes=data.num_nodes, dtype=torch.long)
+        deg += torch.bincount(d, minlength=deg.numel())
+
+    return deg
+
+def build_graph_node_features(obs, scheduled, n_machines):
+    obs = np.asarray(obs, dtype=np.float32)
+
+    T = obs.shape[0]
+    A = obs[:, :T]
+    base = obs[:, T:T + n_machines + 1]
+
+    machine_oh = base[:, :n_machines]
+    clb_data = clb(A, base).astype(np.float32, copy=False)
+    is_scheduled = scheduled.astype(np.float32).reshape(-1, 1)
+
+    x = np.concatenate(
+        [machine_oh, is_scheduled, clb_data],
+        axis=1,
+    ).astype(np.float32)
+
+    return A.astype(np.float32), x
 
 def generate_jsp_instance(
     n_jobs: int,
