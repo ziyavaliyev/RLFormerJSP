@@ -474,8 +474,8 @@ def main():
         if global_step - last_eval_step >= eval_every:
             last_eval_step = global_step
             val_metrics = evaluate_rl_model(agent, val_instances, baseline_summary, cfg, device, encoder=encoder, latent_dim=latent_dim)
-            if "optimality_gap_percent" in val_metrics:
-                best_optimality_gap = min(best_optimality_gap, val_metrics["optimality_gap_percent"])
+            """if "optimality_gap_percent" in val_metrics:
+                best_optimality_gap = min(best_optimality_gap, val_metrics["optimality_gap_percent"])"""
             writer.add_scalar("val/mean_makespan", val_metrics["mean_makespan"], global_step)
             writer.add_scalar("val/std_makespan", val_metrics["std_makespan"], global_step)
             if "optimality_gap_percent" in val_metrics:
@@ -507,16 +507,20 @@ def main():
                 f"SPS={int(global_step / (time.time() - start_time))}"
             )
 
-            if val_metrics["optimality_gap_percent"] <= best_optimality_gap:
+            current_gap = val_metrics["optimality_gap_percent"]
+            if current_gap < best_optimality_gap:
+                best_optimality_gap = current_gap
                 best_val_makespan = val_metrics["mean_makespan"]
-                torch.save(agent.state_dict(), f"runs/{run_name}/checkpoints/best_rl.pt")
-                if cfg["logging"]["use_wandb"]:
-                    artifact = wandb.Artifact(name=f"{run_name}-best-model", type="model")
-                    artifact.add_file(f"runs/{run_name}/checkpoints/best_rl.pt")
-                    artifact.add_file(f"runs/{run_name}/checkpoints/best_metrics.json")
-                    wandb.log_artifact(artifact)
-                
-                with open(f"runs/{run_name}/checkpoints/best_metrics.json", "w") as f:
+
+                torch.save(
+                    agent.state_dict(),
+                    f"runs/{run_name}/checkpoints/best_rl.pt"
+                )
+
+                with open(
+                    f"runs/{run_name}/checkpoints/best_metrics.json",
+                    "w"
+                ) as f:
                     json.dump(val_metrics, f, indent=2)
 
     final_metrics = evaluate_rl_model(
@@ -555,6 +559,24 @@ def main():
     writer.close()
 
     if cfg["logging"]["use_wandb"]:
+
+        best_model_path = f"runs/{run_name}/checkpoints/best_rl.pt"
+        best_metrics_path = f"runs/{run_name}/checkpoints/best_metrics.json"
+
+        if os.path.isfile(best_model_path):
+
+            artifact = wandb.Artifact(
+                name=f"{run_name}-best-model",
+                type="model",
+            )
+
+            artifact.add_file(best_model_path)
+
+            if os.path.isfile(best_metrics_path):
+                artifact.add_file(best_metrics_path)
+
+            wandb.log_artifact(artifact)
+
         wandb.finish()
 
 
