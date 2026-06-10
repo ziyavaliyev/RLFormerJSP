@@ -11,6 +11,13 @@ from jsp_rl.utils import generate_jsp_instance
 from graph_jsp_env.disjunctive_graph_jsp_env import DisjunctiveGraphJspEnv
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/ppo_20x20.yaml")
+    parser.add_argument("--out", type=str, default="data/val_dataset_20x20.pt")
+    return parser.parse_args()
+
+
 def load_yaml(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
@@ -24,6 +31,7 @@ def summarize(values):
         "min": float(values.min()),
         "max": float(values.max()),
     }
+
 
 def make_eval_env(instance, left_shift=True):
     return DisjunctiveGraphJspEnv(
@@ -78,7 +86,6 @@ def select_action(instance, valid_actions, rule):
 
 def rollout_dispatching_rule(instance, rule, left_shift=True):
     env = make_eval_env(instance, left_shift=left_shift)
-
     obs, _ = env.reset()
 
     done = False
@@ -89,7 +96,6 @@ def rollout_dispatching_rule(instance, rule, left_shift=True):
         valid_actions = np.flatnonzero(mask)
 
         action = int(select_action(instance, valid_actions, rule))
-
         obs, reward, done, truncated, info = env.step(action)
 
     return {"makespan": int(info["makespan"])}
@@ -99,7 +105,6 @@ def rollout_random_policy(instance, seed=42, left_shift=True):
     rng = np.random.default_rng(seed)
 
     env = make_eval_env(instance, left_shift=left_shift)
-
     obs, _ = env.reset()
 
     done = False
@@ -110,23 +115,15 @@ def rollout_random_policy(instance, seed=42, left_shift=True):
         valid_actions = np.flatnonzero(mask)
 
         action = int(rng.choice(valid_actions))
-
         obs, reward, done, truncated, info = env.step(action)
 
     return {"makespan": int(info["makespan"])}
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/ppo_20x20.yaml")
-    parser.add_argument("--out", type=str, default="data/val_dataset_20x20.pt")
-    args = parser.parse_args()
 
-    cfg = load_yaml(args.config)
-    seed = int(cfg["seed"])
-
+def build_validation_instances(cfg, seed):
     rng = random.Random(seed + 999)
 
-    instances = [
+    return [
         generate_jsp_instance(
             n_jobs=cfg["data"]["n_jobs"],
             n_machines=cfg["data"]["n_machines"],
@@ -137,7 +134,8 @@ def main():
         for _ in range(cfg["data"]["n_val_instances"])
     ]
 
-    rules = ["spt", "mwkr", "fdd_mwkr", "mopnr"]
+
+def benchmark_instances(instances, rules, seed):
     per_instance = []
 
     for i, instance in enumerate(instances):
@@ -161,14 +159,21 @@ def main():
 
         per_instance.append(item)
 
+    return per_instance
+
+
+def build_summary(per_instance, rules):
     summary = {
-        "random": summarize([x["random"] for x in per_instance]),
-        "spt": summarize([x["spt"] for x in per_instance]),
-        "mwkr": summarize([x["mwkr"] for x in per_instance]),
-        "fdd_mwkr": summarize([x["fdd_mwkr"] for x in per_instance]),
-        "mopnr": summarize([x["mopnr"] for x in per_instance]),
+        "random": summarize([x["random"] for x in per_instance])
     }
 
+    for rule in rules:
+        summary[rule] = summarize([x[rule] for x in per_instance])
+
+    return summary
+
+
+def save_dataset(cfg, instances, per_instance, summary, out_path):
     data = {
         "config": cfg,
         "instances": instances,
@@ -176,14 +181,45 @@ def main():
         "summary": summary,
     }
 
-    out_path = Path(args.out)
+    out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     torch.save(data, out_path)
 
-    print(json.dumps(summary, indent=2))
-    print(f"Saved to {out_path}")
-
+    return out_path
 
 if __name__ == "__main__":
-    main()
+
+    # Load configuration and validation settings.
+    args = parse_args()
+    cfg = load_yaml(args.config)
+    seed = int(cfg["seed"])
+
+    # Generate a fixed validation dataset.
+    instances = build_validation_instances(cfg, seed)
+
+    # Evaluate all baseline dispatching rules.
+    rules = ["spt", "mwkr", "fdd_mwkr", "mopnr"]
+    per_instance = benchmark_instances(
+        instances,
+        rules,
+        seed,
+    )
+
+    # Compute summary statistics.
+    summary = build_summary(
+        per_instance,
+        rules,
+    )
+
+    # Save dataset, per-instance results, and summary.
+    out_path = save_dataset(
+        cfg=cfg,
+        instances=instances,
+        per_instance=per_instance,
+        summary=summary,
+        out_path=args.out,
+    )
+
+    print(json.dumps(summary, indent=2))
+    print(f"Saved to {out_path}")
