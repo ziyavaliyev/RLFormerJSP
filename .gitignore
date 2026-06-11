@@ -2,3 +2,4 @@
 /wandb
 /src/jsp_rl.egg-info
 /src/jsp_rl/__pycache__
+.DS_Store
