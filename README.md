@@ -1,6 +1,6 @@
 # RLFormerJSP
 
-RLFormerJSP is a reinforcement learning framework for solving the **Job Shop Scheduling Problem (JSP)** using Transformer-based policies and graph representation learning.
+RLFormerJSP is a reinforcement learning framework for solving the **Job Shop Scheduling Problem (JSP)** using attention-based policies and graph representation learning.
 
 The repository investigates whether latent graph representations learned by **Graph Autoencoders (GAE)** and **Variational Graph Autoencoders (VGAE)** can improve reinforcement learning performance compared to handcrafted scheduling features and graph-based baselines.
 
@@ -129,21 +129,6 @@ ppo_6x6.yaml
 ppo_10x10.yaml
 ppo_15x15.yaml
 ppo_20x20.yaml
-```
-
-Typical configuration:
-
-```yaml
-data:
-  n_jobs: 10
-  n_machines: 10
-
-observation:
-  mode: handcrafted
-
-ppo:
-  total_timesteps: 1000000
-  learning_rate: 0.0003
 ```
 
 Most experiments can be reproduced by modifying only the configuration file.
@@ -313,16 +298,6 @@ python scripts/train_ppo.py \
     --config configs/ppo_10x10.yaml
 ```
 
-The implementation includes:
-
-- Transformer policy network
-- Attention-based action selection
-- PPO with GAE
-- Action masking
-- Learning-rate annealing
-- Parallel environments
-- Validation-based checkpointing
-
 ---
 
 # Running Individual Representations
@@ -386,14 +361,6 @@ runs/
     │
     └── last_rl.pt
 ```
-
-The best checkpoint is selected according to:
-
-```text
-best_optimality_gap_percent
-```
-
-and not according to the final training iteration.
 
 ---
 
